@@ -53,7 +53,7 @@ class AttendanceController extends Controller
             $q->where('a.received_at', '>', date('Y-m-d H:i:s', (int) $since));
         }
 
-        $rows = $q->orderByDesc('a.id')->limit($n)->get();
+        $rows = $q->orderByDesc('a.id')->get();
 
         $out = $rows->map(function ($r) {
             $ts = $r->received_at ? (int) strtotime($r->received_at) : 0;

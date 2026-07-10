@@ -6,6 +6,7 @@ use App\Models\ZkAttendance;
 use App\Models\ZkDevice;
 use App\Services\ZKLib;
 use Illuminate\Console\Command;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\DB;
 use Throwable;
 
@@ -38,6 +39,11 @@ class ZktListen extends Command
 
         $debug      = (bool) $this->option('debug');
         $reconnect  = ! (bool) $this->option('no-reconnect');
+
+        if (!$this->preflight($key, $cfg['ip'] ?? null)) {
+            return self::FAILURE;
+        }
+
         $storageDir = config('zkteco.storage_dir');
         if (!is_dir($storageDir)) { @mkdir($storageDir, 0777, true); }
         $jsonl  = $storageDir . DIRECTORY_SEPARATOR . "events-$key.jsonl";
@@ -129,8 +135,8 @@ class ZktListen extends Command
                     $line = json_encode($event + ['device' => $key, 'received_at' => $now], JSON_UNESCAPED_SLASHES) . "\n";
                     @file_put_contents($jsonl, $line, FILE_APPEND | LOCK_EX);
 
-                    $insertRow = function () use ($key, $event, $now): void {
-                        DB::table('zk_attendance')->insertOrIgnore([
+                    $insertRow = function () use ($key, $event, $now): int {
+                        return (int) DB::table('zk_attendance')->insertOrIgnore([
                             'device_id'   => $key,
                             'user_id'     => $event['user_id'],
                             'device_time' => $event['timestamp'],
@@ -141,17 +147,25 @@ class ZktListen extends Command
                         ]);
                     };
                     try {
-                        $insertRow();
+                        $affected = $insertRow();
+                        $this->reportSuppressedInsertIfNeeded($key, $event, $affected);
                     } catch (Throwable $e) {
                         // MySQL may have silently dropped a long-idle connection
                         // (e.g. overnight). Reconnect once and retry before
                         // giving up — the punch is already safe in the JSONL.
                         try {
                             DB::reconnect();
-                            $insertRow();
+                            $affected = $insertRow();
+                            $this->reportSuppressedInsertIfNeeded($key, $event, $affected);
                             $lastDbPing = $nowTs; // connection is fresh
                         } catch (Throwable $e2) {
                             $this->warn("[$key] DB insert failed (after reconnect): " . $e2->getMessage());
+                            Log::warning('ZKT attendance DB insert failed after reconnect', [
+                                'device' => $key,
+                                'user_id' => $event['user_id'] ?? null,
+                                'device_time' => $event['timestamp'] ?? null,
+                                'error' => $e2->getMessage(),
+                            ]);
                         }
                     }
 
@@ -176,5 +190,73 @@ class ZktListen extends Command
             try { $zk->disconnect(); } catch (Throwable $ignored) {}
             if (!$reconnect) return self::SUCCESS;
         }
+    }
+
+    private function preflight(string $key, ?string $ip): bool
+    {
+        if (!extension_loaded('sockets')) {
+            $this->error('Missing PHP extension: sockets. Enable ext-sockets for CLI PHP used by artisan.');
+            return false;
+        }
+
+        $dbDriver = (string) config('database.default');
+        if (in_array($dbDriver, ['mysql', 'mariadb'], true) && !extension_loaded('pdo_mysql')) {
+            $this->error('Missing PHP extension: pdo_mysql. Enable it in CLI php.ini.');
+            return false;
+        }
+        if ($dbDriver === 'pgsql' && !extension_loaded('pdo_pgsql')) {
+            $this->error('Missing PHP extension: pdo_pgsql. Enable it in CLI php.ini.');
+            return false;
+        }
+
+        try {
+            DB::select('SELECT 1');
+            DB::table('zk_attendance')->limit(1)->get();
+        } catch (Throwable $e) {
+            $this->error("[$key] Database preflight failed: " . $e->getMessage());
+            $this->warn('Check DB_HOST/DB_PORT/DB_DATABASE/DB_USERNAME/DB_PASSWORD and make sure migrations ran on server.');
+            return false;
+        }
+
+        if (!$ip) {
+            $this->error("[$key] Missing device IP in config/zkteco.php or env (ZKT_*_IP).");
+            return false;
+        }
+
+        return true;
+    }
+
+    private function reportSuppressedInsertIfNeeded(string $key, array $event, int $affected): void
+    {
+        if ($affected > 0) {
+            return;
+        }
+
+        $isKnownDuplicate = DB::table('zk_attendance')
+            ->where('device_id', $key)
+            ->where('user_id', $event['user_id'])
+            ->where('device_time', $event['timestamp'])
+            ->exists();
+
+        if ($isKnownDuplicate) {
+            return;
+        }
+
+        $msg = sprintf(
+            '[%s] insertOrIgnore affected=0 but row is not an existing duplicate (user=%s, device_time=%s).',
+            $key,
+            (string) ($event['user_id'] ?? ''),
+            (string) ($event['timestamp'] ?? '')
+        );
+
+        $this->warn($msg);
+        Log::warning('ZKT insert suppressed unexpectedly', [
+            'device' => $key,
+            'user_id' => $event['user_id'] ?? null,
+            'device_time' => $event['timestamp'] ?? null,
+            'verify' => $event['verify'] ?? null,
+            'status' => $event['status'] ?? null,
+            'workcode' => $event['workcode'] ?? null,
+        ]);
     }
 }

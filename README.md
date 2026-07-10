@@ -56,3 +56,39 @@ If you discover a security vulnerability within Laravel, please send an e-mail t
 ## License
 
 The Laravel framework is open-sourced software licensed under the [MIT license](https://opensource.org/licenses/MIT).
+
+## ZKT Deployment Checklist
+
+This project inserts attendance only through the long-running Artisan listener process.
+The web page does not insert device punches by itself.
+
+1. Ensure required CLI PHP extensions are enabled:
+
+```bash
+php -m | findstr /I "sockets pdo_mysql pdo_pgsql"
+```
+
+- Required for MySQL deployment: `sockets`, `pdo_mysql`
+- Required for PostgreSQL deployment: `sockets`, `pdo_pgsql`
+
+2. Verify DB connectivity from the same CLI PHP used by your process manager:
+
+```bash
+php artisan migrate --force
+php artisan tinker --execute="DB::select('SELECT 1');"
+```
+
+3. Start the listener (or supervisor) and keep it running:
+
+```bash
+php artisan zkt:listen --device=main_gate
+# or
+php artisan zkt:supervise
+```
+
+4. If rows still do not appear, check logs:
+
+- `storage/logs/laravel.log`
+- `storage/app/zkteco/events-<device>.jsonl`
+
+The listener now performs startup preflight checks and reports missing extensions / DB problems explicitly.
