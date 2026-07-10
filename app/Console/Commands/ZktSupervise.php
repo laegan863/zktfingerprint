@@ -7,9 +7,17 @@ use Illuminate\Console\Command;
 class ZktSupervise extends Command
 {
     protected $signature = 'zkt:supervise
-                            {--windows : Spawn each listener in its own cmd.exe window (Windows only)}';
+                            {--windows : Spawn each listener in its own cmd.exe window (Windows only)}
+                            {--php= : Absolute path to php.exe used for child listeners}
+                            {--artisan= : Absolute path to artisan file used for child listeners}';
 
     protected $description = 'Spawn one zkt:listen process per configured device and auto-restart on crash.';
+
+    protected function configure(): void
+    {
+        parent::configure();
+        $this->setAliases(['ztk:supervise']);
+    }
 
     public function handle(): int
     {
@@ -20,9 +28,34 @@ class ZktSupervise extends Command
         }
 
         $delay      = (int) config('zkteco.supervisor.restart_delay', 3);
-        $phpBin     = PHP_BINARY;
-        $artisan    = base_path('artisan');
+        $phpBin     = (string) ($this->option('php') ?: config('zkteco.supervisor.php_bin', PHP_BINARY));
+        $artisan    = (string) ($this->option('artisan') ?: config('zkteco.supervisor.artisan_path', base_path('artisan')));
+        $workDir    = dirname($artisan) ?: base_path();
         $useWindows = (bool) $this->option('windows') && stripos(PHP_OS, 'WIN') === 0;
+
+        if (!function_exists('proc_open')) {
+            $this->error('proc_open is not available in this PHP runtime. Enable proc_open for CLI/service PHP.');
+            return self::FAILURE;
+        }
+
+        if (!is_file($artisan)) {
+            $this->error("Artisan file not found: {$artisan}");
+            $this->warn('Set an absolute path with --artisan=... or config zkteco.supervisor.artisan_path.');
+            return self::FAILURE;
+        }
+
+        if (!is_dir($workDir)) {
+            $this->error("Working directory not found: {$workDir}");
+            return self::FAILURE;
+        }
+
+        if ((str_contains($phpBin, DIRECTORY_SEPARATOR) || str_contains($phpBin, '/')) && !is_file($phpBin)) {
+            $this->error("PHP binary not found: {$phpBin}");
+            $this->warn('Set an absolute php.exe path with --php=... or config zkteco.supervisor.php_bin.');
+            return self::FAILURE;
+        }
+
+        $this->info("Supervisor runtime: php={$phpBin} artisan={$artisan} cwd={$workDir}");
 
         if ($useWindows) {
             foreach (array_keys($devices) as $key) {
@@ -37,7 +70,7 @@ class ZktSupervise extends Command
 
         $procs = [];
         foreach (array_keys($devices) as $key) {
-            $procs[$key] = $this->spawn($phpBin, $artisan, $key);
+            $procs[$key] = $this->spawn($phpBin, $artisan, $key, $workDir);
         }
 
         // Trap signals if pcntl available.
@@ -73,7 +106,7 @@ class ZktSupervise extends Command
                     @proc_close($p['proc']);
                     sleep($delay);
                     if (!$running) break 2;
-                    $p = $this->spawn($phpBin, $artisan, $key);
+                    $p = $this->spawn($phpBin, $artisan, $key, $workDir);
                 }
             }
             unset($p);
@@ -91,7 +124,7 @@ class ZktSupervise extends Command
         return self::SUCCESS;
     }
 
-    private function spawn(string $phpBin, string $artisan, string $key): array
+    private function spawn(string $phpBin, string $artisan, string $key, string $workDir): array
     {
         $descriptor = [
             0 => ['pipe', 'r'],
@@ -99,9 +132,9 @@ class ZktSupervise extends Command
             2 => ['pipe', 'w'],
         ];
         $cmd = [$phpBin, $artisan, 'zkt:listen', "--device=$key"];
-        $proc = proc_open($cmd, $descriptor, $pipes, base_path());
+        $proc = proc_open($cmd, $descriptor, $pipes, $workDir);
         if (!is_resource($proc)) {
-            $this->error("[$key] Failed to spawn listener.");
+            $this->error("[$key] Failed to spawn listener using php='{$phpBin}' artisan='{$artisan}'.");
             return ['proc' => null];
         }
         stream_set_blocking($pipes[1], false);

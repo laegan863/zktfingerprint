@@ -86,6 +86,20 @@ php artisan zkt:listen --device=main_gate
 php artisan zkt:supervise
 ```
 
+Windows service (WinSW) notes:
+
+- Use absolute paths for both `php.exe` and `artisan`.
+- Set the service working directory to the Laravel project root.
+- Ensure the command name is `zkt:*` (not `ztk:*`).
+- If DB starts slower than the service at boot, keep default DB wait/retry settings or set:
+
+```bash
+ZKT_WAIT_DB_SECONDS=120
+ZKT_DB_RETRY_DELAY=3
+ZKT_PHP_BIN=C:\path\to\php.exe
+ZKT_ARTISAN_PATH=C:\Sites\zktfingerprint\artisan
+```
+
 4. If rows still do not appear, check logs:
 
 - `storage/logs/laravel.log`

@@ -15,9 +15,16 @@ class ZktListen extends Command
     protected $signature = 'zkt:listen
                             {--device= : Device key from config/zkteco.php (e.g. main_gate)}
                             {--debug : Log every raw packet to stdout}
-                            {--no-reconnect : Exit on first disconnect instead of retrying}';
+                            {--no-reconnect : Exit on first disconnect instead of retrying}
+                            {--wait-db= : Seconds to wait for DB at startup (0 = config default, -1 = wait forever)}';
 
     protected $description = 'Connect to one ZKTeco terminal and persist live punches as they happen.';
+
+    protected function configure(): void
+    {
+        parent::configure();
+        $this->setAliases(['ztk:listen']);
+    }
 
     public function handle(): int
     {
@@ -40,7 +47,7 @@ class ZktListen extends Command
         $debug      = (bool) $this->option('debug');
         $reconnect  = ! (bool) $this->option('no-reconnect');
 
-        if (!$this->preflight($key, $cfg['ip'] ?? null)) {
+        if (!$this->preflight($key, $cfg['ip'] ?? null, $this->resolveDbWaitSeconds())) {
             return self::FAILURE;
         }
 
@@ -192,7 +199,7 @@ class ZktListen extends Command
         }
     }
 
-    private function preflight(string $key, ?string $ip): bool
+    private function preflight(string $key, ?string $ip, int $waitDbSeconds): bool
     {
         if (!extension_loaded('sockets')) {
             $this->error('Missing PHP extension: sockets. Enable ext-sockets for CLI PHP used by artisan.');
@@ -209,12 +216,7 @@ class ZktListen extends Command
             return false;
         }
 
-        try {
-            DB::select('SELECT 1');
-            DB::table('zk_attendance')->limit(1)->get();
-        } catch (Throwable $e) {
-            $this->error("[$key] Database preflight failed: " . $e->getMessage());
-            $this->warn('Check DB_HOST/DB_PORT/DB_DATABASE/DB_USERNAME/DB_PASSWORD and make sure migrations ran on server.');
+        if (!$this->waitForDatabase($key, $waitDbSeconds)) {
             return false;
         }
 
@@ -224,6 +226,52 @@ class ZktListen extends Command
         }
 
         return true;
+    }
+
+    private function resolveDbWaitSeconds(): int
+    {
+        $raw = $this->option('wait-db');
+        if ($raw === null || $raw === '') {
+            return (int) config('zkteco.supervisor.wait_db_seconds', 120);
+        }
+
+        $seconds = (int) $raw;
+        if ($seconds === 0) {
+            return (int) config('zkteco.supervisor.wait_db_seconds', 120);
+        }
+
+        return $seconds;
+    }
+
+    private function waitForDatabase(string $key, int $waitSeconds): bool
+    {
+        $retryDelay = max(1, (int) config('zkteco.supervisor.db_retry_delay', 3));
+        $deadline = $waitSeconds < 0 ? null : time() + max(0, $waitSeconds);
+        $firstFailure = true;
+
+        while (true) {
+            try {
+                DB::select('SELECT 1');
+                DB::table('zk_attendance')->limit(1)->get();
+                return true;
+            } catch (Throwable $e) {
+                if ($deadline !== null && time() >= $deadline) {
+                    $this->error("[$key] Database preflight failed: " . $e->getMessage());
+                    $this->warn('Check DB_HOST/DB_PORT/DB_DATABASE/DB_USERNAME/DB_PASSWORD and make sure migrations ran on server.');
+                    return false;
+                }
+
+                if ($firstFailure) {
+                    $mode = $waitSeconds < 0 ? 'forever' : "up to {$waitSeconds}s";
+                    $this->warn("[$key] Database is not ready yet; waiting {$mode} before giving up.");
+                    $firstFailure = false;
+                }
+
+                $remaining = $deadline === null ? 'unknown' : max(0, $deadline - time()) . 's';
+                $this->warn("[$key] DB unavailable ({$e->getMessage()}). Retrying in {$retryDelay}s (remaining: {$remaining}).");
+                sleep($retryDelay);
+            }
+        }
     }
 
     private function reportSuppressedInsertIfNeeded(string $key, array $event, int $affected): void
