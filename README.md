@@ -100,6 +100,34 @@ ZKT_PHP_BIN=C:\path\to\php.exe
 ZKT_ARTISAN_PATH=C:\Sites\zktfingerprint\artisan
 ```
 
+### Installing `zkt:supervise` as a Windows Service (auto-start + auto-restart)
+
+`php artisan zkt:service` generates a [WinSW](https://github.com/winsw/winsw) config and wraps
+`zkt:supervise` as a real Windows Service, so it starts automatically on boot and gets restarted
+by Windows if it ever crashes (no logged-in session or scheduled task required).
+
+1. Download `WinSW.exe` (the `WinSW-x64.exe` asset) from the
+   [WinSW releases page](https://github.com/winsw/winsw/releases).
+2. Install the service, pointing `--winsw` at the downloaded exe the first time:
+
+```bash
+php artisan zkt:service install --winsw="C:\path\to\WinSW-x64.exe"
+```
+
+   This writes `winsw\ZktSupervisor.exe` and `winsw\ZktSupervisor.xml` in the project root
+   (configurable via `ZKT_SERVICE_NAME` / `ZKT_WINSW_DIR` in `.env`), using the same
+   `ZKT_PHP_BIN` / `ZKT_ARTISAN_PATH` settings as `zkt:supervise`.
+3. Start it:
+
+```bash
+php artisan zkt:service start
+```
+
+Other actions: `stop`, `restart`, `uninstall`, `status`. Service logs are written to
+`storage/logs/winsw/`, and per-device output still goes through `zkt:supervise`'s own logging.
+Run this from an elevated (Administrator) terminal — installing/starting a Windows Service
+requires admin rights.
+
 4. If rows still do not appear, check logs:
 
 - `storage/logs/laravel.log`

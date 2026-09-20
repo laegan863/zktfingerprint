@@ -54,6 +54,7 @@ class ZktListen extends Command
         $storageDir = config('zkteco.storage_dir');
         if (!is_dir($storageDir)) { @mkdir($storageDir, 0777, true); }
         $jsonl  = $storageDir . DIRECTORY_SEPARATOR . "events-$key.jsonl";
+        $pendingJsonl = $storageDir . DIRECTORY_SEPARATOR . "pending-$key.jsonl";
         $pidF   = $storageDir . DIRECTORY_SEPARATOR . "listener-$key.pid";
         @file_put_contents($pidF, (string) getmypid());
 
@@ -62,6 +63,7 @@ class ZktListen extends Command
             ['device_id' => $key],
             ['name' => $cfg['name'] ?? $key, 'ip' => $cfg['ip']]
         );
+        $this->replayPendingEvents($key, $pendingJsonl);
 
         $this->info("[$key] Connecting to {$cfg['ip']}:{$cfg['port']} ...");
 
@@ -80,6 +82,7 @@ class ZktListen extends Command
         // but cloud/shared hosts often set it to 1h or less).
         $dbPingEvery   = 1800;   // seconds
         $lastDbPing    = time();
+        $lastPendingReplay = time();
 
         while (true) {
             $zk = new ZKLib(
@@ -113,8 +116,6 @@ class ZktListen extends Command
                     $now   = date('Y-m-d H:i:s');
                     $nowTs = time();
 
-                    // Periodic DB keepalive — runs at most once per tick
-                    // (generator yields on every received packet or keep-alive ACK).
                     if ($nowTs - $lastDbPing >= $dbPingEvery) {
                         try { DB::select('SELECT 1'); } catch (Throwable $ignored) {
                             try { DB::reconnect(); } catch (Throwable $ignored2) {}
@@ -122,9 +123,6 @@ class ZktListen extends Command
                         $lastDbPing = $nowTs;
                     }
 
-                    // Signature ignores verify/status because the device sometimes
-                    // emits both a "fingerprint verified" and an "attendance log"
-                    // packet for the same physical punch with differing fields.
                     $sig = $key . '|' . $event['user_id'] . '|' . $event['timestamp'];
 
                     // Purge old entries.
@@ -137,43 +135,32 @@ class ZktListen extends Command
                         }
                         continue;
                     }
-                    $recent[$sig] = $nowTs;
 
                     $line = json_encode($event + ['device' => $key, 'received_at' => $now], JSON_UNESCAPED_SLASHES) . "\n";
                     @file_put_contents($jsonl, $line, FILE_APPEND | LOCK_EX);
 
-                    $insertRow = function () use ($key, $event, $now): int {
-                        return (int) DB::table('zk_attendance')->insertOrIgnore([
-                            'device_id'   => $key,
-                            'user_id'     => $event['user_id'],
-                            'device_time' => $event['timestamp'],
-                            'received_at' => $now,
-                            'verify'      => $event['verify'],
-                            'status'      => $event['status'],
-                            'workcode'    => $event['workcode'],
-                        ]);
-                    };
                     try {
-                        $affected = $insertRow();
-                        $this->reportSuppressedInsertIfNeeded($key, $event, $affected);
+                        $this->persistEventWithRetry($key, $event, $now);
+                        $recent[$sig] = $nowTs;
                     } catch (Throwable $e) {
-                        // MySQL may have silently dropped a long-idle connection
-                        // (e.g. overnight). Reconnect once and retry before
-                        // giving up — the punch is already safe in the JSONL.
-                        try {
-                            DB::reconnect();
-                            $affected = $insertRow();
-                            $this->reportSuppressedInsertIfNeeded($key, $event, $affected);
-                            $lastDbPing = $nowTs; // connection is fresh
-                        } catch (Throwable $e2) {
-                            $this->warn("[$key] DB insert failed (after reconnect): " . $e2->getMessage());
-                            Log::warning('ZKT attendance DB insert failed after reconnect', [
-                                'device' => $key,
-                                'user_id' => $event['user_id'] ?? null,
-                                'device_time' => $event['timestamp'] ?? null,
-                                'error' => $e2->getMessage(),
-                            ]);
-                        }
+                        $pending = $event + ['device' => $key, 'received_at' => $now];
+                        @file_put_contents(
+                            $pendingJsonl,
+                            json_encode($pending, JSON_UNESCAPED_SLASHES) . "\n",
+                            FILE_APPEND | LOCK_EX
+                        );
+                        $this->warn("[$key] DB insert failed; event queued in pending spool: " . $e->getMessage());
+                        Log::warning('ZKT attendance event queued for retry', [
+                            'device' => $key,
+                            'user_id' => $event['user_id'] ?? null,
+                            'device_time' => $event['timestamp'] ?? null,
+                            'error' => $e->getMessage(),
+                        ]);
+                    }
+
+                    if ($nowTs - $lastPendingReplay >= 30) {
+                        $this->replayPendingEvents($key, $pendingJsonl);
+                        $lastPendingReplay = $nowTs;
                     }
 
                     $this->line(sprintf(
@@ -191,12 +178,85 @@ class ZktListen extends Command
                 $backoff = min($maxBackoff, $backoff * 2);
                 continue;
             }
-
-            // liveCapture() is an infinite loop; reaching here means it
-            // returned cleanly (shouldn't happen). Reconnect just in case.
             try { $zk->disconnect(); } catch (Throwable $ignored) {}
             if (!$reconnect) return self::SUCCESS;
         }
+    }
+
+    private function persistEventWithRetry(string $key, array $event, string $receivedAt): void
+    {
+        $row = [
+            'device_id'   => $key,
+            'user_id'     => $event['user_id'],
+            'device_time' => $event['timestamp'],
+            'received_at' => $receivedAt,
+            'verify'      => $event['verify'],
+            'status'      => $event['status'],
+            'workcode'    => $event['workcode'],
+        ];
+
+        $lastError = null;
+        for ($attempt = 1; $attempt <= 3; $attempt++) {
+            try {
+                $affected = (int) DB::table('zk_attendance')->insertOrIgnore($row);
+                if (!$this->reportSuppressedInsertIfNeeded($key, $event, $affected)) {
+                    throw new RuntimeException('Database ignored attendance insert without creating or finding the row.');
+                }
+                return;
+            } catch (Throwable $e) {
+                $lastError = $e;
+                try { DB::reconnect(); } catch (Throwable $ignored) {}
+                if ($attempt < 3) {
+                    sleep($attempt);
+                }
+            }
+        }
+
+        throw $lastError ?? new RuntimeException('Unknown attendance persistence failure.');
+    }
+
+    private function replayPendingEvents(string $key, string $pendingJsonl): void
+    {
+        if (!is_file($pendingJsonl) || filesize($pendingJsonl) === 0) {
+            return;
+        }
+
+        $remaining = [];
+        $replayBlocked = false;
+        $handle = @fopen($pendingJsonl, 'rb');
+        if (!$handle) {
+            return;
+        }
+
+        while (($line = fgets($handle)) !== false) {
+            if ($replayBlocked) {
+                $remaining[] = $line;
+                continue;
+            }
+
+            $event = json_decode(trim($line), true);
+            if (!is_array($event) || !isset($event['user_id'], $event['timestamp'])) {
+                $remaining[] = $line;
+                continue;
+            }
+
+            try {
+                $this->persistEventWithRetry($key, $event, (string) ($event['received_at'] ?? now()->format('Y-m-d H:i:s')));
+            } catch (Throwable $e) {
+                $remaining[] = $line;
+                $this->warn("[$key] Pending event still cannot be stored: " . $e->getMessage());
+                $replayBlocked = true;
+            }
+        }
+        fclose($handle);
+
+        if ($remaining === []) {
+            @unlink($pendingJsonl);
+            $this->info("[$key] Pending attendance events replayed successfully.");
+            return;
+        }
+
+        @file_put_contents($pendingJsonl, implode('', $remaining), LOCK_EX);
     }
 
     private function preflight(string $key, ?string $ip, int $waitDbSeconds): bool
@@ -274,10 +334,10 @@ class ZktListen extends Command
         }
     }
 
-    private function reportSuppressedInsertIfNeeded(string $key, array $event, int $affected): void
+    private function reportSuppressedInsertIfNeeded(string $key, array $event, int $affected): bool
     {
         if ($affected > 0) {
-            return;
+            return true;
         }
 
         $isKnownDuplicate = DB::table('zk_attendance')
@@ -287,7 +347,7 @@ class ZktListen extends Command
             ->exists();
 
         if ($isKnownDuplicate) {
-            return;
+            return true;
         }
 
         $msg = sprintf(
@@ -306,5 +366,7 @@ class ZktListen extends Command
             'status' => $event['status'] ?? null,
             'workcode' => $event['workcode'] ?? null,
         ]);
+
+        return false;
     }
 }

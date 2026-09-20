@@ -75,6 +75,19 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Windows Service (WinSW)
+    |--------------------------------------------------------------------------
+    | Used by `php artisan zkt:service` to install a Windows Service that runs
+    | `zkt:supervise` and auto-restarts on crash or server reboot.
+    */
+    'service' => [
+        'name' => env('ZKT_SERVICE_NAME', 'ZktSupervisor'),
+        'display_name' => env('ZKT_SERVICE_DISPLAY_NAME', 'ZKT Supervisor'),
+        'winsw_dir' => env('ZKT_WINSW_DIR', base_path('winsw')),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
     | Storage (JSONL backup of every captured event, per device)
     |--------------------------------------------------------------------------
     */

@@ -7,6 +7,7 @@ use Illuminate\Console\Command;
 class ZktSupervise extends Command
 {
     protected $signature = 'zkt:supervise
+                            {--device= : Run only the selected device key}
                             {--windows : Spawn each listener in its own cmd.exe window (Windows only)}
                             {--php= : Absolute path to php.exe used for child listeners}
                             {--artisan= : Absolute path to artisan file used for child listeners}';
@@ -25,6 +26,15 @@ class ZktSupervise extends Command
         if (!$devices) {
             $this->error('No devices configured in config/zkteco.php.');
             return self::FAILURE;
+        }
+
+        $device = $this->option('device');
+        if ($device !== null) {
+            if (!array_key_exists($device, $devices)) {
+                $this->error("Unknown device '$device'. Available: " . implode(', ', array_keys($devices)));
+                return self::INVALID;
+            }
+            $devices = [$device => $devices[$device]];
         }
 
         $delay      = (int) config('zkteco.supervisor.restart_delay', 3);
